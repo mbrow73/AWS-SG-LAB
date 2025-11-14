@@ -1,0 +1,163 @@
+name: Terraform Plan and Apply
+
+on:
+  pull_request:
+    paths:
+      - 'terraform/**'
+  push:
+    branches: [main]
+    paths:
+      - 'terraform/**'
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+env:
+  TF_VERSION: '1.6.0'
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Terraform Init
+        run: terraform init
+        working-directory: terraform
+      
+      - name: Terraform Validate
+        run: terraform validate
+        working-directory: terraform
+      
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+        working-directory: terraform
+      
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan -no-color -out=tfplan 2>&1 | tee plan.txt
+          echo "exitcode=$?" >> $GITHUB_OUTPUT
+        working-directory: terraform
+        continue-on-error: true
+      
+      - name: Parse plan for security review
+        run: |
+          python3 << 'EOF'
+          import re, os
+          
+          with open('terraform/plan.txt') as f:
+            plan = f.read()
+          
+          resources = re.findall(r'# (aws_vpc_security_group_\w+_rule\.\w+) will be created', plan)
+          changes = re.findall(r'Plan: (\d+) to add, (\d+) to change, (\d+) to destroy', plan)
+          
+          summary = "## 📊 Terraform Plan Summary\n\n"
+          
+          if changes:
+            add, change, destroy = changes[0]
+            summary += f"**Changes:** {add} to add, {change} to change, {destroy} to destroy\n\n"
+          
+          if resources:
+            summary += "**New Security Group Rules:**\n"
+            for r in resources:
+              summary += f"- `{r}`\n"
+          
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+            f.write(summary)
+          EOF
+      
+      - name: Comment plan on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('terraform/plan.txt', 'utf8');
+            const truncated = plan.length > 60000 ? plan.substring(0, 60000) + '\n\n... (truncated)' : plan;
+            
+            const body = `## Terraform Plan
+            
+            \`\`\`terraform
+            ${truncated}
+            \`\`\`
+            
+            **Plan Status:** ${{ steps.plan.outputs.exitcode == 0 && '✅ Success' || '❌ Failed' }}
+            `;
+            
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+      
+      - name: Fail if plan failed
+        if: steps.plan.outputs.exitcode != 0
+        run: exit 1
+
+  apply:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Terraform Init
+        run: terraform init
+        working-directory: terraform
+      
+      - name: Terraform Apply
+        run: terraform apply -auto-approve
+        working-directory: terraform
+      
+      - name: Extract issue number from commit
+        id: issue
+        run: |
+          ISSUE=$(git log -1 --pretty=%B | grep -oP 'issue #\K\d+' || echo "")
+          echo "number=$ISSUE" >> $GITHUB_OUTPUT
+      
+      - name: Comment on issue
+        if: steps.issue.outputs.number != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              issue_number: ${{ steps.issue.outputs.number }},
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '✅ **Security group rule has been applied to AWS**\n\nYour request has been successfully deployed.'
+            });
+            
+            await github.rest.issues.update({
+              issue_number: ${{ steps.issue.outputs.number }},
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'closed',
+              labels: ['completed']
+            });

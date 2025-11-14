@@ -1,0 +1,47 @@
+name: Security Scan
+
+on:
+  pull_request:
+    paths:
+      - 'terraform/**/*.tf'
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Scan for 0.0.0.0/0 ingress
+        run: |
+          if grep -r "cidr_ipv4.*=.*\"0\.0\.0\.0/0\"" terraform/rules/ && grep -r "ingress" terraform/rules/; then
+            echo "::warning::Found ingress rule with 0.0.0.0/0 - requires extra scrutiny"
+          fi
+      
+      - name: Check for overly permissive rules
+        run: |
+          python3 << 'EOF'
+          import glob, re
+          
+          warnings = []
+          for f in glob.glob('terraform/rules/**/*.tf', recursive=True):
+            content = open(f).read()
+            
+            if re.search(r'from_port\s*=\s*0', content) and re.search(r'to_port\s*=\s*65535', content):
+              warnings.append(f"{f}: All ports (0-65535)")
+            
+            if re.search(r'ip_protocol\s*=\s*"-1"', content):
+              warnings.append(f"{f}: All protocols")
+          
+          if warnings:
+            print("⚠️  Overly permissive rules found:")
+            for w in warnings:
+              print(f"  {w}")
+          EOF
+      
+      - name: Validate descriptions exist
+        run: |
+          if ! grep -r "description\s*=" terraform/rules/; then
+            echo "::error::All rules must have descriptions"
+            exit 1
+          fi

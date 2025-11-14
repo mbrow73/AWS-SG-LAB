@@ -1,0 +1,217 @@
+name: Security Group Rule Request
+description: Request new security group rules (SG-to-IP, SG-to-SG, or SG-to-Prefix List)
+title: "[SG Rule] "
+labels: ["security-group-rule", "pending-review"]
+assignees:
+  - security-ops-team
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Security Group Rule Request
+        
+        Complete all required fields below. The security operations team will review your request.
+        
+        **Supported Rule Types:**
+        - `sg_to_cidr`: Security Group to IP/CIDR block
+        - `sg_to_sg`: Security Group to Security Group
+        - `sg_to_prefix_list`: Security Group to AWS Prefix List
+        
+        **Important:**
+        - All changes require security ops approval
+        - Invalid configurations will be automatically rejected
+        - Duplicate rules will be detected and blocked
+
+  - type: input
+    id: vpc_id
+    attributes:
+      label: VPC ID
+      description: The VPC where the security group exists (e.g., vpc-0123456789abcdef0)
+      placeholder: vpc-0123456789abcdef0
+    validations:
+      required: true
+
+  - type: input
+    id: security_group_id
+    attributes:
+      label: Security Group ID
+      description: Target security group ID (e.g., sg-0123456789abcdef0)
+      placeholder: sg-0123456789abcdef0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: rule_type
+    attributes:
+      label: Rule Type
+      description: Type of security group rule
+      options:
+        - sg_to_cidr
+        - sg_to_sg
+        - sg_to_prefix_list
+    validations:
+      required: true
+
+  - type: dropdown
+    id: direction
+    attributes:
+      label: Direction
+      description: Traffic direction
+      options:
+        - ingress
+        - egress
+    validations:
+      required: true
+
+  - type: input
+    id: from_port
+    attributes:
+      label: From Port
+      description: Starting port number (0-65535, or -1 for all)
+      placeholder: "443"
+    validations:
+      required: true
+
+  - type: input
+    id: to_port
+    attributes:
+      label: To Port
+      description: Ending port number (0-65535, or -1 for all)
+      placeholder: "443"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: protocol
+    attributes:
+      label: Protocol
+      description: IP protocol
+      options:
+        - tcp
+        - udp
+        - icmp
+        - icmpv6
+        - all
+        - Custom protocol number
+    validations:
+      required: true
+
+  - type: input
+    id: protocol_number
+    attributes:
+      label: Protocol Number (if custom)
+      description: Only required if you selected "Custom protocol number" above (e.g., 50 for ESP)
+      placeholder: "50"
+    validations:
+      required: false
+
+  - type: textarea
+    id: cidr_blocks
+    attributes:
+      label: CIDR Blocks (for sg_to_cidr only)
+      description: |
+        One CIDR block per line. IPv4 format (e.g., 10.0.0.0/8)
+        Leave empty if using sg_to_sg or sg_to_prefix_list
+      placeholder: |
+        10.0.0.0/8
+        172.16.0.0/12
+    validations:
+      required: false
+
+  - type: textarea
+    id: ipv6_cidr_blocks
+    attributes:
+      label: IPv6 CIDR Blocks (for sg_to_cidr only)
+      description: |
+        One IPv6 CIDR block per line
+        Leave empty if not using IPv6
+      placeholder: |
+        2001:db8::/32
+    validations:
+      required: false
+
+  - type: input
+    id: source_security_group_id
+    attributes:
+      label: Source Security Group ID (for sg_to_sg only)
+      description: The source security group ID (e.g., sg-9876543210fedcba0)
+      placeholder: sg-9876543210fedcba0
+    validations:
+      required: false
+
+  - type: input
+    id: prefix_list_id
+    attributes:
+      label: Prefix List ID (for sg_to_prefix_list only)
+      description: AWS-managed or customer-managed prefix list (e.g., pl-0123456789abcdef0)
+      placeholder: pl-0123456789abcdef0
+    validations:
+      required: false
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Rule Description
+      description: Clear description of the purpose of this rule
+      placeholder: "Allow HTTPS traffic from corporate VPN to application servers"
+    validations:
+      required: true
+
+  - type: textarea
+    id: business_justification
+    attributes:
+      label: Business Justification
+      description: Why is this rule needed? What service/application requires it?
+      placeholder: "Required for API Gateway to access backend microservices in private subnet"
+    validations:
+      required: true
+
+  - type: input
+    id: requested_by
+    attributes:
+      label: Requested By
+      description: Your name and team
+      placeholder: "John Doe - Platform Engineering Team"
+    validations:
+      required: true
+
+  - type: markdown
+    attributes:
+      value: |
+        ---
+        
+        ### Examples
+        
+        #### Example 1: Allow HTTPS from specific CIDR
+        ```
+        Rule Type: sg_to_cidr
+        Direction: ingress
+        From Port: 443
+        To Port: 443
+        Protocol: tcp
+        CIDR Blocks: 10.0.0.0/8
+        Description: Allow HTTPS from corporate network
+        ```
+        
+        #### Example 2: Allow database access between security groups
+        ```
+        Rule Type: sg_to_sg
+        Direction: ingress
+        From Port: 3306
+        To Port: 3306
+        Protocol: tcp
+        Source Security Group ID: sg-app123456
+        Description: Allow MySQL access from app tier
+        ```
+        
+        #### Example 3: Allow S3 access via prefix list
+        ```
+        Rule Type: sg_to_prefix_list
+        Direction: egress
+        From Port: 443
+        To Port: 443
+        Protocol: tcp
+        Prefix List ID: pl-s3-us-east-1
+        Description: Allow HTTPS to S3 service
+        ```

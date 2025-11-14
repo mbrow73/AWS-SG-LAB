@@ -1,0 +1,3 @@
+terraform/rules/** @security-ops-team
+.github/workflows/** @security-ops-team @platform-team
+scripts/** @platform-team

@@ -1,0 +1,251 @@
+name: Process Security Group Request
+
+on:
+  issues:
+    types: [opened, edited]
+
+permissions:
+  issues: write
+  contents: write
+  pull-requests: write
+
+jobs:
+  validate:
+    if: contains(github.event.issue.labels.*.name, 'security-group-rule')
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: pip install pyyaml ipaddress
+      
+      - name: Extract issue body
+        run: echo "${{ github.event.issue.body }}" > /tmp/issue_body.txt
+      
+      - name: Validate configuration
+        id: validate
+        run: |
+          python scripts/validate.py /tmp/issue_body.txt > /tmp/validation_output.txt 2>&1
+          VALIDATION_EXIT=$?
+          
+          if [ $VALIDATION_EXIT -eq 0 ]; then
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "VALIDATION PASSED" >> $GITHUB_STEP_SUMMARY
+            cat /tmp/validation_output.txt >> $GITHUB_STEP_SUMMARY
+          else
+            echo "status=failed" >> $GITHUB_OUTPUT
+            echo "## ❌ Validation Failed" >> $GITHUB_STEP_SUMMARY
+            cat /tmp/validation_output.txt >> $GITHUB_STEP_SUMMARY
+          fi
+        continue-on-error: true
+      
+      - name: Comment validation results
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const output = fs.readFileSync('/tmp/validation_output.txt', 'utf8');
+            const status = '${{ steps.validate.outputs.status }}';
+            
+            const body = status === 'success' 
+              ? `## ✅ Validation Successful\n\n\`\`\`\n${output}\n\`\`\`\n\n**Next Steps:**\n- Security Ops team will review this request\n- If approved, a PR will be automatically created\n- The PR must be merged to apply changes`
+              : `## ❌ Validation Failed\n\n\`\`\`\n${output}\n\`\`\`\n\n**Action Required:**\nPlease fix the errors above and edit this issue.`;
+            
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+            
+            if (status !== 'success') {
+              await github.rest.issues.addLabels({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                labels: ['validation-failed']
+              });
+              core.setFailed('Validation failed');
+            } else {
+              await github.rest.issues.addLabels({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                labels: ['validation-passed', 'awaiting-security-review']
+              });
+            }
+
+  create-pr:
+    needs: validate
+    if: contains(github.event.issue.labels.*.name, 'validation-passed')
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: pip install pyyaml
+      
+      - name: Extract and validate
+        run: |
+          echo "${{ github.event.issue.body }}" > /tmp/issue_body.txt
+          python scripts/validate.py /tmp/issue_body.txt
+      
+      - name: Load validated config
+        id: config
+        run: |
+          python3 << 'EOF'
+          import yaml, os, json
+          with open('/tmp/validated_config.yml') as f:
+            config = yaml.safe_load(f)
+          
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+            f.write(f"vpc_id={config['vpc_id']}\n")
+            f.write(f"sg_id={config['security_group_id']}\n")
+            f.write(f"rule_type={config['rule_type']}\n")
+          EOF
+      
+      - name: Generate Terraform code
+        run: |
+          python3 << 'PYEOF'
+          import yaml, re, os
+          
+          with open('/tmp/validated_config.yml') as f:
+            config = yaml.safe_load(f)
+          
+          vpc_id = config['vpc_id']
+          sg_id = config['security_group_id']
+          rule_type = config['rule_type']
+          direction = config['direction']
+          issue_num = os.environ['ISSUE_NUMBER']
+          
+          safe_desc = re.sub(r'[^a-z0-9_]', '_', config['description'].lower())
+          rule_id = f"{rule_type}_{direction}_{config['from_port']}_{config['to_port']}_{safe_desc[:30]}"
+          
+          lines = [
+            f"# Rule: {config['description']}",
+            f"# Requested by: {config['requested_by']}",
+            f"# Business justification: {config['business_justification']}",
+            f"# Issue: #{issue_num}",
+            "",
+            f'resource "aws_vpc_security_group_{direction}_rule" "{rule_id}" ' + '{',
+            f'  security_group_id = "{sg_id}"',
+            f'  description       = "{config["description"]}"',
+            f'  from_port         = {config["from_port"] if config["from_port"] != -1 else "null"}',
+            f'  to_port           = {config["to_port"] if config["to_port"] != -1 else "null"}',
+            f'  ip_protocol       = "{config["protocol"]}"'
+          ]
+          
+          if rule_type == 'sg_to_cidr':
+            if config.get('cidr_blocks'):
+              lines.append(f'  cidr_ipv4 = "{config["cidr_blocks"][0]}"')
+            if config.get('ipv6_cidr_blocks'):
+              lines.append(f'  cidr_ipv6 = "{config["ipv6_cidr_blocks"][0]}"')
+          elif rule_type == 'sg_to_sg':
+            lines.append(f'  referenced_security_group_id = "{config["source_security_group_id"]}"')
+          elif rule_type == 'sg_to_prefix_list':
+            lines.append(f'  prefix_list_id = "{config["prefix_list_id"]}"')
+          
+          lines.extend([
+            '',
+            '  tags = {',
+            '    ManagedBy    = "terraform"',
+            f'    RequestIssue = "#{issue_num}"',
+            '  }',
+            '}'
+          ])
+          
+          file_path = f"terraform/rules/{vpc_id}/{sg_id}/{rule_id}.tf"
+          os.makedirs(os.path.dirname(file_path), exist_ok=True)
+          
+          with open(file_path, 'w') as f:
+            f.write('\n'.join(lines))
+          
+          print(f"Created: {file_path}")
+          PYEOF
+        env:
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+      
+      - name: Create Pull Request
+        id: create_pr
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: |
+            Add security group rule from issue #${{ github.event.issue.number }}
+            
+            ${{ github.event.issue.title }}
+          branch: sg-rule-issue-${{ github.event.issue.number }}
+          delete-branch: true
+          title: '[Security Group] ${{ github.event.issue.title }}'
+          body: |
+            ## 🔒 Security Group Rule Request
+            
+            **Requested by:** ${{ github.event.issue.user.login }}
+            **Source Issue:** #${{ github.event.issue.number }}
+            
+            ---
+            
+            ### 📋 Request Details
+            
+            ${{ github.event.issue.body }}
+            
+            ---
+            
+            ### 🔍 Security Ops Review Checklist
+            
+            - [ ] Business justification is valid and appropriate
+            - [ ] Rule follows principle of least privilege
+            - [ ] CIDR ranges/source SGs are appropriate for the use case
+            - [ ] Port range is minimized to required ports only
+            - [ ] Description clearly explains the rule's purpose
+            - [ ] No overly permissive rules (0.0.0.0/0 should be rare)
+            - [ ] Rule doesn't conflict with security policies
+            - [ ] Requestor has authority to request this access
+            
+            ### ⚠️ Important Notes
+            
+            - This PR was automatically generated from a validated issue
+            - Merging this PR will apply the security group rule to AWS
+            - Terraform plan will run automatically on this PR
+            - All checks must pass before merging
+            
+            ---
+            
+            **Security Ops:** Please review and approve if the request meets security requirements.
+            
+            To approve: Add your approval review
+            To reject: Close this PR and comment on issue #${{ github.event.issue.number }} with rejection reason
+          labels: |
+            security-group-rule
+            needs-security-review
+          reviewers: |
+            security-ops-team
+      
+      - name: Update issue with PR link
+        if: steps.create_pr.outputs.pull-request-number
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `✅ **Pull Request Created**\n\nYour request has been converted to PR #${{ steps.create_pr.outputs.pull-request-number }}\n\nThe Security Operations team will review your request. You'll be notified of any updates.`
+            });
+            
+            await github.rest.issues.addLabels({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: ['pr-created']
+            });
